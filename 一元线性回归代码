@@ -1,0 +1,83 @@
+#一元线性回归
+import numpy as np
+import pandas as pd #可以读取excel等表格
+
+#可视化库：直接用里面的库函数
+import matplotlib.pyplot as plt
+import seaborn as sns
+
+#数据集测试，训练，验证（更好的测试模型怎么样）
+from sklearn.model_selection import train_test_split
+from sklearn.linear_model import LinearRegression
+from sklearn.metrics import mean_squared_error, r2_score,mean_absolute_error#(所有的回归模型都可以用)
+#均方误差，r方决定系数，平均绝对误差
+
+#统计分析库
+import statsmodels.api as sm
+from scipy import stats
+
+#设置可视化风格
+sns.set_style("whitegrid")
+plt.rcParams['font.sans-serif']=['SimHei']#用来正常显示中文标签
+plt.rcParams['axes.unicode_minus'] = False
+
+#加载一下外部文件，如csv
+
+#数据模拟
+#1.生成随机数，保证运行程序时假数据是一样的
+np.random.seed(25)
+#2.制造学习时间
+study_hours = np.random.uniform(1,10,100).reshape(-1,1)
+#niform(1, 10, 100)：意思是随机生成 100个数字，这些数字均匀分布在 1到10之间。
+# 代表100个学生，每人每天学习1到10个小时
+# .reshape(-1, 1)：这是个格式调整操作，把它变成机器学习算法喜欢的“竖长条”表格格式。
+
+#3.制造考试成绩
+exam_scores = 30 + 7 * study_hours + np.random.normal(0, 5, 100).reshape(-1, 1)
+#最后一项是随机噪声
+
+#4.打包进excel表格
+data = pd.DataFrame({'Study_Hours':study_hours.flatten(),'Exam_Scores':exam_scores.flatten()})
+
+
+#检查一下
+#print(data.head())
+
+#print(study_hours.flatten())
+
+
+
+#缺失值检查
+#均值填充，删除缺失值，异常值分析
+#均值填充的话，可以用
+print('数据基本统计信息')
+print(data.describe())
+#用mean：后面的平均值干就行
+
+#数据预处理
+import pandas as pd
+
+# 读取数据（换成你的文件名）
+#data = pd.read_excel("数据.xlsx")   # 如果是CSV就写 pd.read_csv("数据.csv")
+
+# 看前5行
+print(data.head())
+
+# 看基本信息：有多少行、有没有缺失值、数据类型
+print(data.info())
+
+# 看统计摘要：均值、标准差、最大最小值、四分位数
+print(data.describe())
+
+#数据缺失值
+# 看看每列有多少缺失值
+print(data.isnull().sum())
+
+# 方法A：删掉有缺失的行（简单粗暴，数据多的时候用）
+data_clean = data.dropna()
+
+# 方法B：用均值/中位数填充（数据少的时候用，保留样本量）
+data['某列名'] = data['某列名'].fillna(data['某列名'].mean())   # 均值填充
+# data['某列名'] = data['某列名'].fillna(data['某列名'].median())  # 中位数填充
+
+
