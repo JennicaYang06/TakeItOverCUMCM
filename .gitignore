@@ -20,5 +20,5 @@
 *.vrb
 *.xdv
 
-# Compiled output (uncomment if you don't want PDFs tracked in git)
-# *.pdf
+# Compiled output
+*.pdf
