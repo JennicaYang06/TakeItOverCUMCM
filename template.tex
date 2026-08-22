@@ -1,0 +1,423 @@
+% ============================================================
+% MCM/ICM STARTER TEMPLATE
+% ============================================================
+% This is a working template for the Mathematical Contest in
+% Modeling (MCM) / Interdisciplinary Contest in Modeling (ICM).
+%
+% IMPORTANT MCM RULES baked into this file:
+%   - Papers must be written in ENGLISH.
+%   - You must NOT put your name, school, or advisor anywhere in
+%     the paper (blind review). Only your team control number
+%     goes on the summary sheet.
+%   - Papers have a strict PAGE LIMIT (check current-year rules,
+%     historically 25 pages including everything but the
+%     Report Summary counts toward it in recent years -- always
+%     re-check the official rules PDF for the year you compete).
+%
+% How to use this file:
+%   1. Read the comments (%) -- they explain what each block does,
+%      what you should change, and common mistakes.
+%   2. Delete the example content (marked EXAMPLE) and replace it
+%      with your own.
+%   3. Compile with pdfLaTeX (or XeLaTeX/LuaLaTeX if you add
+%      non-Latin fonts). If you use natbib/bibtex, remember the
+%      compile sequence: pdflatex -> bibtex -> pdflatex -> pdflatex.
+% ============================================================
+
+\documentclass[12pt, letterpaper]{article}
+% [12pt] font size -- MCM has no strict font-size rule, but 12pt
+%   body / reasonable margins is the safe, common choice.
+% [letterpaper] MCM is a US-run contest -- use letterpaper, not a4paper.
+%   WRONG:  \documentclass[a4paper]{article}  (margins won't match
+%           the page-limit expectations most teams design around)
+
+% ---------------- PACKAGES ----------------
+% Load only what you use. A huge unused preamble is a common
+% novice habit -- it doesn't break compilation but it's clutter
+% and can occasionally cause package-conflict errors.
+
+\usepackage[utf8]{inputenc}     % lets you type UTF-8 characters directly
+\usepackage[T1]{fontenc}        % better font encoding / hyphenation for accented chars
+\usepackage{amsmath, amssymb, amsthm}
+                                 % amsmath: align, cases, matrices, \text{}
+                                 % amssymb: extra symbols like \mathbb{R}, \leq, \geq
+                                 % amsthm:  \newtheorem for Theorem/Lemma/Definition boxes
+\usepackage{geometry}
+\geometry{margin=1in}           % 1-inch margins is the safe default.
+                                 % WRONG: shrinking margins to 0.5in to cram in more
+                                 % text -- graders notice, and past a certain point
+                                 % it looks like you're gaming the page limit.
+
+\usepackage{graphicx}           % \includegraphics{...}
+\usepackage{float}              % gives the [H] "put it EXACTLY here" figure placement
+\usepackage{caption, subcaption} % nicer captions + side-by-side subfigures
+\usepackage{booktabs}           % \toprule \midrule \bottomrule -- professional-looking tables
+                                 % WRONG: using \hline everywhere (looks like Excel, not a paper)
+\usepackage{multirow}           % merge table cells vertically
+\usepackage{array}              % extra column types, e.g. fixed-width columns
+
+\usepackage{algorithm}          % floating "Algorithm N" box
+\usepackage{algpseudocode}      % \State, \If, \For, \While, etc. pseudocode commands
+
+\usepackage{listings}           % source-code listings (for your appendix)
+\usepackage{xcolor}             % \textcolor{}, and needed by listings for code coloring
+
+\usepackage[
+  sort&compress,     % combine consecutive citation numbers like [3-5]
+  numbers            % numeric citation style [1], [2], ... (common for MCM)
+]{natbib}
+% Alternative if your coordinator/advisor prefers author-year style:
+%   \usepackage[round]{natbib}   -> gives (Smith, 2020) instead of [1]
+% Pick ONE citation style and use it consistently. Mixing \cite styles
+% is a common mistake that looks sloppy to judges.
+
+\usepackage{hyperref}           % clickable links/refs -- LOAD THIS LAST
+% WRONG: loading hyperref before other packages (e.g. before amsthm,
+% algorithm) can break their cross-referencing; hyperref should
+% almost always be the last (or second-to-last, before cleveref) package.
+\hypersetup{
+  colorlinks=true,
+  linkcolor=black,   % internal refs (sections/figures) -- black keeps it print-friendly
+  citecolor=black,
+  urlcolor=blue,
+  pdftitle={Your Paper Title},
+  pdfauthor={},      % LEAVE BLANK -- do not put your name (blind review)
+}
+
+\usepackage{fancyhdr}           % custom headers/footers, e.g. team number on every page
+\pagestyle{fancy}
+\fancyhf{}
+\fancyhead[C]{Team \#XXXXXX}    % <-- replace XXXXXX with your real team control number
+\fancyfoot[C]{\thepage}
+\renewcommand{\headrulewidth}{0.4pt}
+
+% ---------------- THEOREM-LIKE ENVIRONMENTS ----------------
+% Optional -- useful if your model has formal definitions/assumptions
+% you want numbered and visually boxed.
+\newtheorem{assumption}{Assumption}
+\newtheorem{definition}{Definition}
+
+% ============================================================
+% DOCUMENT
+% ============================================================
+\begin{document}
+
+% ---------------- SUMMARY SHEET (Page 1) ----------------
+% MCM requires a one-page "Summary" (sometimes called Abstract).
+% It is judged heavily -- many teams say it's the single most
+% important page, since judges triage papers by it.
+% RULES: no name/school here. Team number and problem letter ARE
+% allowed (check the current problem statement for the exact
+% required header format -- it changes slightly year to year).
+
+\begin{center}
+    {\Large\bfseries Your Paper Title Here}\\[6pt]
+    % EXAMPLE -- replace with your title. Keep it descriptive,
+    % not generic ("A Model for..." is overused and vague).
+
+    \textbf{Team \#XXXXXX}
+\end{center}
+
+\begin{abstract}
+% EXAMPLE summary structure (fill each part in ~1 short paragraph):
+%   1. Restate the problem in your own words (1-2 sentences).
+%   2. State your overall approach / key model(s) used.
+%   3. State your main results / numbers, not just "we solved it."
+%   4. State strengths/limitations briefly.
+%   5. One sentence on real-world implication or recommendation.
+%
+% WRONG: copy-pasting the problem statement here -- judges have
+% already read it; restate it, don't repeat it verbatim.
+% WRONG: leaving out actual numeric results -- "our model performs
+% well" is meaningless without a number or comparison.
+
+This paper addresses \dots We propose a \dots model combining
+\dots Our results show that \dots We validate the model via
+\dots and find it is robust to \dots but sensitive to \dots
+Overall, our approach suggests that \dots
+
+\textbf{Keywords:} keyword one; keyword two; keyword three
+% 3-5 keywords is typical.
+\end{abstract}
+
+\newpage
+\tableofcontents
+\newpage
+
+% ============================================================
+% 1. INTRODUCTION
+% ============================================================
+\section{Introduction}
+
+\subsection{Problem Background}
+% Give context: why does this problem matter in the real world?
+% One paragraph, cite real sources if you use them (\citep{...}).
+
+\subsection{Restatement of the Problem}
+% Rewrite the problem in your own precise, technical language.
+% This is where you convert a fuzzy prompt into something you
+% can actually build equations for.
+
+\subsection{Our Work}
+% A short roadmap: "In Section 2 we state our assumptions... In
+% Section 3 we build Model I... In Section 4 we test..."
+% This costs you almost nothing and helps judges navigate a paper
+% they're skimming under time pressure.
+
+% ============================================================
+% 2. ASSUMPTIONS AND JUSTIFICATIONS
+% ============================================================
+\section{Assumptions}
+% Every assumption needs a ONE-LINE justification. An unjustified
+% assumption reads as "we didn't think about this."
+% WRONG:
+%   \item Air resistance is negligible.
+% RIGHT:
+%   \item Air resistance is negligible, since the object's terminal
+%     velocity in this regime is over two orders of magnitude
+%     larger than its actual speed.
+
+\begin{itemize}
+    \item \textbf{Assumption 1:} \dots
+    \\ \textit{Justification:} \dots
+    \item \textbf{Assumption 2:} \dots
+    \\ \textit{Justification:} \dots
+\end{itemize}
+
+% ============================================================
+% 3. NOTATION
+% ============================================================
+\section{Notation}
+% A symbol table. Judges (and you, three days into the contest)
+% will thank you. Put it early, before your model, not buried
+% in an appendix.
+
+\begin{table}[H]
+    \centering
+    \caption{Notation used in this paper}
+    \begin{tabular}{cl}
+        \toprule
+        \textbf{Symbol} & \textbf{Meaning} \\
+        \midrule
+        $x$        & description of $x$ \\
+        $\theta$   & description of $\theta$ \\
+        $t$        & time (units: \dots) \\
+        \bottomrule
+    \end{tabular}
+    \label{tab:notation}
+\end{table}
+% ALWAYS give units where relevant -- a common judge complaint is
+% "no units anywhere in the model."
+
+% ============================================================
+% 4. MODEL
+% ============================================================
+\section{Model Development}
+
+\subsection{Overview}
+% One paragraph: what kind of model (ODE, optimization, ML,
+% simulation, graph-theoretic, ...) and why that choice fits
+% the problem, before diving into equations.
+
+\subsection{Model Formulation}
+
+% ---- Single numbered equation ----
+Consider the relationship between $x$ and $t$ given by
+\begin{equation}
+    \frac{dx}{dt} = r x \left(1 - \frac{x}{K}\right)
+    \label{eq:logistic}
+\end{equation}
+where $r$ is the growth rate and $K$ is the carrying capacity.
+% \label + \eqref lets you refer back: "as shown in
+% Equation~\eqref{eq:logistic}". Always \label equations you cite
+% later -- don't hardcode "Equation (3)" as literal text, since
+% renumbering will silently break it.
+
+% ---- Multi-line aligned equations ----
+% Use `align` (not several separate `equation`s) when you want
+% equals signs lined up, e.g. deriving a result step by step:
+\begin{align}
+    f(x) &= a x^2 + bx + c \\
+         &= a\left(x + \frac{b}{2a}\right)^2 + \left(c - \frac{b^2}{4a}\right)
+\end{align}
+% WRONG: using multiple $$ ... $$ blocks for this -- $$ is
+% deprecated LaTeX2e style; use \[ \] or, better, a numbered
+% environment like equation/align so you can reference it.
+
+% ---- Piecewise definition ----
+\begin{equation}
+    g(x) =
+    \begin{cases}
+        1 & \text{if } x \geq 0, \\
+        0 & \text{if } x < 0.
+    \end{cases}
+\end{equation}
+
+% ---- Matrix ----
+\begin{equation}
+    A =
+    \begin{pmatrix}
+        a_{11} & a_{12} \\
+        a_{21} & a_{22}
+    \end{pmatrix}
+\end{equation}
+% bmatrix gives [ ], pmatrix gives ( ), vmatrix gives | | (determinant-style).
+
+\subsection{Algorithm}
+% If your model involves a procedure (simulation, optimization
+% loop, etc.), a pseudocode box is often clearer than prose.
+\begin{algorithm}[H]
+    \caption{Example iterative update}
+    \label{alg:example}
+    \begin{algorithmic}[1]
+        \State Initialize $x_0$, tolerance $\epsilon$, max iterations $N$
+        \For{$k = 0, 1, \dots, N$}
+            \State $x_{k+1} \gets x_k - \eta \nabla f(x_k)$
+            \If{$|x_{k+1} - x_k| < \epsilon$}
+                \State \textbf{break}
+            \EndIf
+        \EndFor
+        \State \Return $x_{k+1}$
+    \end{algorithmic}
+\end{algorithm}
+
+% ============================================================
+% 5. FIGURES AND TABLES
+% ============================================================
+\section{Results}
+
+% ---- Single figure ----
+% \begin{figure}[H]
+%     \centering
+%     \includegraphics[width=0.7\textwidth]{figures/my_plot.png}
+%     \caption{Description of what this figure shows and why it matters.}
+%     \label{fig:my-plot}
+% \end{figure}
+% Commented out because the image file doesn't exist yet --
+% uncomment once you have figures/my_plot.png. Compiling with a
+% missing image path is a very common first error.
+%
+% WRONG: \caption{Figure 1.} -- a caption should describe the
+% content, not just label it; LaTeX numbers it for you already.
+
+% ---- Two subfigures side by side ----
+% \begin{figure}[H]
+%     \centering
+%     \begin{subfigure}[b]{0.45\textwidth}
+%         \includegraphics[width=\textwidth]{figures/left.png}
+%         \caption{Left condition}
+%     \end{subfigure}
+%     \hfill
+%     \begin{subfigure}[b]{0.45\textwidth}
+%         \includegraphics[width=\textwidth]{figures/right.png}
+%         \caption{Right condition}
+%     \end{subfigure}
+%     \caption{Overall caption comparing both panels.}
+%     \label{fig:comparison}
+% \end{figure}
+
+% ---- Table with booktabs (the "professional" table style) ----
+\begin{table}[H]
+    \centering
+    \caption{Example results table}
+    \begin{tabular}{lcc}
+        \toprule
+        \textbf{Scenario} & \textbf{Metric A} & \textbf{Metric B} \\
+        \midrule
+        Baseline    & 0.42 & 1.30 \\
+        Variant 1   & 0.51 & 1.12 \\
+        Variant 2   & 0.39 & 1.45 \\
+        \bottomrule
+    \end{tabular}
+    \label{tab:results}
+\end{table}
+% WRONG table habits to avoid:
+%   - vertical rules (|) between every column -- visually noisy
+%   - \hline above and below every row -- use booktabs rules instead
+%   - forgetting \label / \caption -- every float should have both
+
+% ============================================================
+% 6. SENSITIVITY ANALYSIS
+% ============================================================
+\section{Sensitivity Analysis}
+% Judges specifically look for this section. Pick 1-2 key
+% parameters, vary them, and show/discuss how much the output
+% changes. "Our model is robust because..." backed by a number
+% or plot is much stronger than asserting robustness with no test.
+
+% ============================================================
+% 7. STRENGTHS AND WEAKNESSES
+% ============================================================
+\section{Strengths and Weaknesses}
+
+\subsection{Strengths}
+\begin{itemize}
+    \item \dots
+\end{itemize}
+
+\subsection{Weaknesses}
+\begin{itemize}
+    \item \dots
+\end{itemize}
+% Being honest here is rewarded, not punished -- a model with no
+% acknowledged weaknesses reads as either untested or unaware.
+
+% ============================================================
+% 8. CONCLUSION
+% ============================================================
+\section{Conclusion}
+% Summarize findings and, if the problem calls for it, give a
+% concrete recommendation ("we recommend policy X because...").
+
+% ============================================================
+% REFERENCES
+% ============================================================
+% Two common approaches -- pick ONE:
+%
+% (A) Manual bibliography (fine for MCM's typically small
+%     reference lists, and avoids a BibTeX build step):
+\begin{thebibliography}{9}
+    \bibitem{smith2020}
+    A. Smith, ``Title of the paper,'' \textit{Journal Name}, vol. 1,
+    pp. 1--10, 2020.
+
+    \bibitem{website2023}
+    Organization Name, ``Title of the page,'' 2023. [Online].
+    Available: \url{https://example.com}. [Accessed: Aug. 22, 2026].
+\end{thebibliography}
+% Cite these in text with \cite{smith2020}.
+%
+% (B) BibTeX (better for many references; needs a references.bib file):
+%   \bibliographystyle{plainnat}
+%   \bibliography{references}
+% and compile pdflatex -> bibtex template -> pdflatex -> pdflatex.
+%
+% WRONG: mixing (A) and (B) in the same document, or citing a
+% source in text that never appears in the bibliography (and
+% vice versa) -- both are easy to do by accident, so check before
+% submitting.
+
+% ============================================================
+% APPENDIX
+% ============================================================
+\appendix
+\section{Code}
+% If you used code (Python/MATLAB/R) to generate results, include
+% the key parts here so judges can verify your methodology.
+\begin{lstlisting}[language=Python, basicstyle=\small\ttfamily, breaklines=true]
+import numpy as np
+
+def logistic_growth(x0, r, K, steps):
+    x = x0
+    trajectory = [x]
+    for _ in range(steps):
+        x = x + r * x * (1 - x / K)
+        trajectory.append(x)
+    return np.array(trajectory)
+\end{lstlisting}
+% \lstinputlisting[language=Python]{code/my_script.py}
+% is often better than pasting code inline -- it pulls directly
+% from your actual script file, so you can't accidentally paste
+% a stale/edited-after-the-fact version.
+
+\end{document}
