@@ -85,11 +85,13 @@ TBL3_DATES = [datetime(2025, 3, 20), datetime(2025, 6, 21),
 
 # ===================== 2B 灵敏度设置 =====================
 # Ḡ = ρ · 全年最大负载。ρ 高时 12000kWh/5000kW 储能足以完全削峰 ⇒ 紧急购电为 0；
-# ρ 需降到较低才会逼出紧急购电，故这里从 0.30 扫到 1.00。
+# 实测阈值在 ρ≈0.6~0.7：ρ≥0.70 紧急购电=0；ρ=0.60 仅 8 时段/2 天；ρ≤0.50 迅速上升。
 RHO_LIST = [0.30, 0.40, 0.50, 0.60, 0.70, 0.80, 0.90, 1.00]
-# result2_capacity_limited.xlsx 用哪个 ρ：自动取「仍会出现紧急购电的最大 ρ」
-# （即最温和、但仍能体现紧急购电的容量限制）；若全程无紧急购电则取最小 ρ。
-RHO_PRIMARY_2B = None
+# result2_capacity_limited.xlsx 用哪个 ρ：取 0.50 —— 外网容量降到峰值一半，
+# 紧急购电占总费用约 4%（明显但不极端），作为「容量受限」的代表情形。
+RHO_PRIMARY_2B = 0.50
+# 论文里额外展示这几个 ρ 下表3四日期的紧急购电
+RHO_SHOW = [0.30, 0.40, 0.50]
 
 # 表1 指定单个 10 分钟时段；t = 起始分钟/10
 TBL1_SLOTS = [("10:00-10:10", 60), ("12:00-12:10", 72), ("14:00-14:10", 84),
@@ -207,12 +209,8 @@ for rho in RHO_LIST:
     print(f"  ρ={rho:.2f}  Ḡ={gbar:7.1f}kW  计划费={r['plan_cost']:.1f}  "
           f"紧急费={r['emer_cost']:.1f}  总={r['total_cost']:.1f}  紧急时段={ei} 紧急天数={ed}")
 
-# 选 primary：仍有紧急天数的最大 ρ；若全程无紧急购电，则取最小 ρ
-_with_emer = [rho for (rho, _, _, _, _, _, ed) in sens_rows if ed > 0]
-RHO_PRIMARY_2B = max(_with_emer) if _with_emer else min(RHO_LIST)
 r2b_primary = results_2b[RHO_PRIMARY_2B]
-print(f"2B primary: ρ={RHO_PRIMARY_2B:.2f}"
-      + ("" if _with_emer else "（全程无紧急购电，取最小 ρ 仅作展示）"))
+print(f"2B primary: ρ={RHO_PRIMARY_2B:.2f}  Ḡ={RHO_PRIMARY_2B*LOAD_PEAK:.1f} kW")
 
 # ============================ 工具函数 ============================
 
@@ -277,12 +275,14 @@ for rho, gbar, pc, ec, tc, ei, ed in sens_rows:
     lines.append(f"{rho:6.2f}{gbar:12.1f}{pc:16.1f}{ec:16.1f}{tc:16.1f}{ei:10d}{ed:10d}")
 lines.append("")
 
-if r2b_primary is not None:
-    lines.append(f"—— 以下按 ρ={RHO_PRIMARY_2B}（Ḡ={RHO_PRIMARY_2B*LOAD_PEAK:.1f}kW）给出表3四日期的紧急购电 ——")
+for rho in RHO_SHOW:
+    res = results_2b[rho]
+    lines.append(f"—— ρ={rho:.2f}（Ḡ={rho*LOAD_PEAK:.1f}kW）表3四日期的紧急购电 ——")
     for D_ in TBL3_DATES:
         di = (D_ - PLAN_START).days
-        _, _, _, _, _, _, emer = daily_tables(r2b_primary, di)
-        lines.append(f"  {D_:%Y-%m-%d}: {'无' if not emer else ''}")
+        _, _, _, _, _, _, emer = daily_tables(res, di)
+        tot = sum(v for _, v in emer)
+        lines.append(f"  {D_:%Y-%m-%d}: {'无' if not emer else f'合计 {tot:.2f} kWh，{len(emer)} 个时段'}")
         for t, v in emer:
             lines.append(f"    {slot_label(t):<16s}{v:12.4f}")
 
