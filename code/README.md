@@ -2,16 +2,23 @@
 
 ## 环境
 
-这台机器上没有安装可用的 Python（`python` 指向的是 Microsoft Store 占位程序）。
-先装一个真正的 Python，再装依赖：
+`python` 指向的是 Microsoft Store 占位程序，装不了包。机器上已有 anaconda3，其中
+`envs\robowriter` 这个环境装了 numpy/pandas/openpyxl/cvxpy/matplotlib，可以直接用：
 
-1. 从 https://www.python.org/downloads/windows/ 下载 Python 3.11/3.12，
-   安装时勾选 **Add python.exe to PATH**。
-   （或用 conda：`conda create -n cumcm python=3.11 -y && conda activate cumcm`）
-2. 安装依赖：
-   ```powershell
+```powershell
+& "$env:USERPROFILE\anaconda3\envs\robowriter\python.exe" code\problem2.py
+```
+
+也可以新建一个专用环境：
+
+1. `conda create -n cumcm python=3.11 -y && conda activate cumcm`
+2. ```powershell
    python -m pip install -r code/requirements.txt
    ```
+
+注意：这些环境都没装问题1用的 `GLPK_MI` 求解器，`problem2.py` 改用了 cvxpy 自带的
+`HIGHS`（开源、速度更快）。如果要让 `problem1.py` 也能跑，把 `solver='GLPK_MI'`
+改成 `solver='HIGHS'` 即可。
 
 ## 运行问题 1
 
@@ -30,25 +37,37 @@ python code/problem1.py
 ## 运行问题 2
 
 ```powershell
-python code/problem2.py
+python code/problem2.py          # 全年 365 天完整仿真
+python code/problem2.py 45       # 调试：只跑前 45 天，快速验证
 ```
 
 输出写到 `results/`：
 
 | 文件 | 内容 |
 | --- | --- |
-| `result2.xlsx` | **2A 基础版**（计划购电无上限），在官方模板上原地填数（提交用主结果） |
-| `result2_capacity_limited.xlsx` | **2B 拓展版**，ρ=0.90（外网正常供电容量 = 0.90×全年最大负载） |
-| `problem2_summary.txt` | 表3 四个指定日期（3/20、6/21、9/23、12/21）的表1/表2 + 全年汇总 |
-| `problem2_sensitivity_capacity.txt` | 2B 对外网容量 Ḡ 的灵敏度表（ρ=0.80~1.00） |
-| `problem2_plot_YYYYMMDD.png` | 四个指定日期的功率平衡 / 储能电量曲线 |
+| `result2.xlsx` | 在官方模板上原地填数（提交用主结果），含"计划购电量/充放电量/紧急购电量"三个sheet |
+| `problem2_summary.txt` | 预测误差、全年费用汇总 + 表3 四个指定日期（3/20、6/21、9/23、12/21）的表1/表2/表3 |
+| `problem2_plot_YYYYMMDD.png` | 四个指定日期的电价/负荷光伏(预测vs实际)/购电功率/储能电量曲线 |
 
-模型：问题 1 的 LP **逐日独立求解 334 次**（2025-02-01~12-31），每天 `s(0)=s(24)=6000`（日周期，
-由"电价逐日相同 ⇒ 最优策略以日为周期"论证）。紧急购电 = 平衡约束里 5×电价的追索变量 `u_t`。
+模型：与问题1不同，负荷和光伏逐日变化且**不再给定预测值**，需要自己预测。每天0:00只能用
+"过去数据"预测当天负荷、光伏曲线，代入问题1同款单日 MILP（`g,c,d,z,soc`，去掉了问题1"0:00=24:00
+电量相同"的单日闭环，改成"次日初始电量=前一天计划末电量"的全年滚动衔接）求出当天计划购电和
+充放电，储能按计划执行、不随实际负荷/光伏调整。白天过去后用附件2真实值回代：供给不够的部分
+按5倍电价紧急购电，多余部分弃用。全年从 2025-1-1（SOC0=6000）跑起，1月作为预测模型的历史预热，
+只导出 2025-2-1~12-31（334天）。
 
-- **2A**：`g_t` 无上限 ⇒ 完全信息下 `u_t≡0`，紧急购电表全 0。
-- **2B**：假设 `g_t ≤ Ḡ·(1/6)`，`Ḡ = ρ·全年最大负载`；负载尖峰超 `Ḡ` 时先用储能削峰、
-  储能耗尽才紧急购电。`RHO_LIST` / `RHO_PRIMARY_2B` 在 `problem2.py` 顶部可调。
+- **负荷预测**：144个时刻分别做加性 Holt-Winters（周期=7天，捕捉工作日/周末模式）。
+- **光伏预测**：晴空包络（滚动90分位数，反映季节性最大出力）× 晴空指数（指数平滑，反映近期
+  天气持续性）。
+- **安全边际（报童模型）**：逐日独立MILP只对"点预测"取等号满足，没有理由为吸收预测误差多买
+  电，导致储能天天被放空、紧急购电占比极高。多买1单位电正常价p，用不完纯浪费；少买1单位、
+  缺口按5倍价紧急买单，比提前买多花 `5p-p=4p`。最优服务水位 `q*=4p/(4p+p)=0.8`，与p无关。
+  代码维护144个时刻各自的"净负荷(负荷-光伏)预测误差"滚动80分位数（`NetErrorTracker`，
+  60天窗口），叠加到点预测上再喂给LP。全年效果：紧急购电时段数从23142降到8593，
+  紧急购电费从333万降到97万，总费用从1514万降到1399万（降约7.6%）。可在文件顶部
+  `USE_SAFETY_MARGIN` 开关对比两种情形。
+
+求解器改用 `HIGHS`（本机没装问题1用的 `GLPK_MI`），性能上365次MILP全部求解约20秒。
 
 ## 模型（问题 1）
 
