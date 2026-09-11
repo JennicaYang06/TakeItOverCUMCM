@@ -62,28 +62,7 @@ if not do_export:
 print(f"[导出区间] {dac.EXPORT_START} (day_idx={export_start_idx}) ~ {dac.EXPORT_END} (day_idx={export_end_idx})")
 
 
-# ======================= 预测模型 =======================
-class LoadForecaster:
-    """按144个时刻分别做加性 Holt-Winters（周期=7天，无趋势项）滚动预测。"""
-
-    def __init__(self, seed_curve, alpha=LOAD_ALPHA, gamma=LOAD_GAMMA):
-        self.alpha = alpha
-        self.gamma = gamma
-        self.level = seed_curve.copy()
-        self.seasonal = np.zeros((len(seed_curve), 7))
-
-    def predict(self, day_idx):
-        dow = day_idx % 7
-        return np.clip(self.level + self.seasonal[:, dow], 0, None)
-
-    def update(self, day_idx, actual):
-        dow = day_idx % 7
-        pred = self.level + self.seasonal[:, dow]
-        err = actual - pred
-        self.level = self.level + self.alpha * err
-        self.seasonal[:, dow] = self.seasonal[:, dow] + self.gamma * err
-
-
+# ======================= 预测模型（负荷预测用 day_ahead_common.LoadForecaster，光伏预测是本版特有）=======================
 class PVForecaster:
     """晴空包络（滚动分位数，反映季节性最大出力）× 晴空指数（指数平滑，反映近期天气持续性）。"""
 
@@ -113,7 +92,7 @@ class PVForecaster:
 
 # ======================= 全年滚动仿真 =======================
 milp = dac.DayAheadMILP(price_avg)
-load_forecaster = LoadForecaster(load_kw_seed)
+load_forecaster = dac.LoadForecaster(load_kw_seed, alpha=LOAD_ALPHA, gamma=LOAD_GAMMA)
 pv_forecaster = PVForecaster(pv_kw_seed)
 net_error_tracker = dac.NetErrorTracker(T)
 
@@ -192,7 +171,7 @@ print(f"\n[汇总] 已写入: {summary_path}")
 
 # ======================= 可选：4个代表日的曲线图 =======================
 try:
-    saved = dac.plot_representative_days(results, dates_str, price_raw, RESULTS_DIR)
+    saved = dac.plot_representative_days(results, dates_str, price_raw, RESULTS_DIR, file_prefix="problem2_plot")
     for p in saved:
         print(f"[作图] 已保存: {p}")
 except Exception as e:

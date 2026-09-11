@@ -58,12 +58,36 @@ def resolve_data_dirs(here: Path):
 
 # ======================= 基础工具函数 =======================
 def adjacent_average(arr):
-    """首尾相接平均：把整点瞬时功率折算成"区间平均功率"，数据点数不变。"""
+    """首尾相接平均：把整点瞬时功率折算成"区间平均功率"，数据点数不变。
+    用于完整一天(144点)的循环数据：第1格用"昨天最后一点"(即arr[-1])做左端点。"""
     arr = np.asarray(arr, dtype=float)
     result = np.zeros(len(arr))
     result[0] = (arr[-1] + arr[0]) / 2
     result[1:] = (arr[:-1] + arr[1:]) / 2
     return result
+
+
+def adjacent_average_with_prev(arr, prev_value):
+    """同 adjacent_average，但左端点显式传入（用于非整天的分段序列，不能用 arr[-1] 兜底）。"""
+    arr = np.asarray(arr, dtype=float)
+    result = np.zeros(len(arr))
+    result[0] = (prev_value + arr[0]) / 2
+    result[1:] = (arr[:-1] + arr[1:]) / 2
+    return result
+
+
+def interp_hourly_to_10min(anchor_value, hourly_values, n_blocks):
+    """把"整点瞬时功率预报"线性插值到10分钟粒度的瞬时功率点序列。
+    anchor_value: 区间起点(当前时刻)的已知瞬时功率。
+    hourly_values: 长度 n_blocks//6 的整点预报（第1个=1小时后，第2个=2小时后...）。
+    返回长度 n_blocks 的瞬时功率序列，对应 10,20,...,n_blocks*10 分钟处的取值
+    （与附件1/2原始数据"每列代表某整10分钟时刻瞬时功率"的约定一致）。"""
+    n_hours = len(hourly_values)
+    assert n_blocks == n_hours * 6, f"n_blocks={n_blocks} 应等于 hourly_values长度({n_hours})*6"
+    anchor_minutes = np.arange(0, n_hours + 1) * 60.0
+    anchor_vals = np.concatenate([[anchor_value], np.asarray(hourly_values, dtype=float)])
+    sample_minutes = np.arange(1, n_blocks + 1) * 10.0
+    return np.interp(sample_minutes, anchor_minutes, anchor_vals)
 
 
 def time_range_str(i):
@@ -137,6 +161,28 @@ def compute_export_range(dates_str, n_days, export_start=EXPORT_START, export_en
     return export_start_idx, export_end_idx, do_export
 
 
+# ======================= 负荷预测（问题2、问题3共用：附件3只给光伏预报，负荷仍需自己预测） =======================
+class LoadForecaster:
+    """按144个时刻分别做加性 Holt-Winters（周期=7天，无趋势项）滚动预测，0:00做一次，全天不再修正。"""
+
+    def __init__(self, seed_curve, alpha=0.25, gamma=0.25):
+        self.alpha = alpha
+        self.gamma = gamma
+        self.level = np.asarray(seed_curve, dtype=float).copy()
+        self.seasonal = np.zeros((len(seed_curve), 7))
+
+    def predict(self, day_idx):
+        dow = day_idx % 7
+        return np.clip(self.level + self.seasonal[:, dow], 0, None)
+
+    def update(self, day_idx, actual):
+        dow = day_idx % 7
+        pred = self.level + self.seasonal[:, dow]
+        err = actual - pred
+        self.level = self.level + self.alpha * err
+        self.seasonal[:, dow] = self.seasonal[:, dow] + self.gamma * err
+
+
 # ======================= 报童安全边际 =======================
 class NetErrorTracker:
     """按144个时刻分别维护"净负荷(=负荷-光伏)预测残差"的滚动历史，供报童安全边际取分位数。"""
@@ -204,6 +250,73 @@ class DayAheadMILP:
         return gv, cv, dv, socv
 
 
+# ======================= 问题3：日内调整 MILP（只重新决策"剩余时段"） =======================
+class SegmentMILP:
+    """
+    问题3的日内调整：0:00的整天计划只是"计划购电量"（对外报告用，也是违约/超额费的基准）。
+    6:00/12:00/18:00各拿到一份新的光伏预报后，只对"接下来这一段"（默认6小时=36格）重新
+    决策 g_adj/c/d/soc，负荷预测维持0点做的那版不变（附件3只更新光伏，没有给负荷的日内预报）。
+
+    费用只算"调整相对计划"的差额：调整量比计划多的部分按1.5倍价格多付，
+    调整量比计划少的部分按0.5倍价格计入违约金（即只按0.5倍价格"补偿"少买的部分，
+    相当于比完全不调整省下0.5倍价格）。计划购电本身的费用(price*g_plan)由调用方另外累加，
+    不放在这个子问题的目标函数里（对本段决策变量而言是常数，不影响最优解)。
+
+    g_adj 与 (up,down) 的关系用等式约束 g_adj-g_plan_orig_p == up-down 显式表达，
+    不能写成 cp.pos(g_adj-g_plan_orig)-cp.pos(g_plan_orig-g_adj) 直接相减——那样一凸一凹，
+    不满足DCP。这里两个辅助变量的目标系数一正一负、净系数为正(1.5-0.5=1>0)，
+    最优解处仍会自动收敛到 up=max(Δ,0)、down=max(-Δ,0) 的精确分解（详见问题3代码顶部注释推导）。
+    """
+
+    def __init__(self, seg_len):
+        self.seg_len = seg_len
+        n = seg_len
+        self.g_adj = cp.Variable(n, nonneg=True, name="g_adj")
+        self.up = cp.Variable(n, nonneg=True, name="adj_up")
+        self.down = cp.Variable(n, nonneg=True, name="adj_down")
+        self.c = cp.Variable(n, nonneg=True, name="charge")
+        self.d = cp.Variable(n, nonneg=True, name="discharge")
+        self.z = cp.Variable(n, boolean=True, name="charge_discharge_flag")
+        self.soc = cp.Variable(n + 1, name="soc")
+
+        self.soc0_p = cp.Parameter(name="soc0")
+        self.load_e_p = cp.Parameter(n, name="load_e")
+        self.pv_e_p = cp.Parameter(n, name="pv_e")
+        self.g_plan_p = cp.Parameter(n, name="g_plan_orig")
+        self.price_p = cp.Parameter(n, nonneg=True, name="price_seg")
+
+        cons = [
+            self.soc[0] == self.soc0_p,
+            self.soc >= SOC_MIN,
+            self.soc <= SOC_MAX,
+            self.soc[1:] == self.soc[:-1] + ETA_C * self.c - self.d / ETA_D,
+            self.c <= E_STEP_MAX,
+            self.d <= E_STEP_MAX,
+            self.g_adj + self.pv_e_p + self.d - self.c >= self.load_e_p,
+            self.c <= E_STEP_MAX * self.z,
+            self.d <= E_STEP_MAX * (1 - self.z),
+            self.g_adj - self.g_plan_p == self.up - self.down,
+        ]
+        adj_cost = self.price_p @ (1.5 * self.up - 0.5 * self.down)
+        self.prob = cp.Problem(cp.Minimize(adj_cost), cons)
+
+    def solve(self, soc0_val, load_e_val, pv_e_val, g_plan_orig_val, price_seg_val):
+        self.soc0_p.value = float(soc0_val)
+        self.load_e_p.value = load_e_val
+        self.pv_e_p.value = pv_e_val
+        self.g_plan_p.value = g_plan_orig_val
+        self.price_p.value = price_seg_val
+        self.prob.solve(solver=SOLVER)
+        if self.prob.status not in ("optimal", "optimal_inaccurate"):
+            raise RuntimeError(f"segment solve failed: status={self.prob.status}")
+        g_adj = np.clip(np.asarray(self.g_adj.value).ravel(), 0.0, None)
+        cv = np.clip(np.asarray(self.c.value).ravel(), 0.0, None)
+        dv = np.clip(np.asarray(self.d.value).ravel(), 0.0, None)
+        socv = np.asarray(self.soc.value).ravel()
+        adj_cost = float(self.prob.value)
+        return g_adj, cv, dv, socv, adj_cost
+
+
 # ======================= 结算一天（计划执行 + 实际值回代 + 紧急购电） =======================
 def settle_day(gv, cv, dv, actual_load_e, actual_pv_e, price_avg):
     actual_supply = gv + actual_pv_e + dv - cv
@@ -213,65 +326,82 @@ def settle_day(gv, cv, dv, actual_load_e, actual_pv_e, price_avg):
     return deficit_e, plan_cost, emerg_cost
 
 
-# ======================= 导出 result2.xlsx 模板 =======================
-def export_result2_template(template_file, out_file, results, export_start_idx, export_end_idx,
-                             price_avg, n_days):
-    from openpyxl import load_workbook
-
-    wb = load_workbook(template_file)
-
-    # ---------- Sheet1: 计划购电量 ----------
-    ws1 = wb["计划购电量"]
+# ======================= 导出 result2.xlsx / result3.xlsx 模板（共用子函数） =======================
+def _fill_purchase_sheet(ws, results, key, export_start_idx, export_end_idx, price_avg, n_days):
+    """填一张"购电量"格式的sheet（144格+下一天首格+全天购电量+全天购电费）。
+    key: results[i] 中购电量数组的字段名（如 'gv'、'g_plan'、'g_final'）。"""
     for i in range(export_start_idx, export_end_idx + 1):
         r = results[i]
         row = 2 + (i - export_start_idx)
-        gv = r["gv"]
+        gv = r[key]
         for col in range(2, 145):          # col2..144 -> gv[1..143]
-            ws1.cell(row=row, column=col, value=round(float(gv[col - 1]), 6))
-        next_gv0 = results[i + 1]["gv"][0] if i + 1 < n_days else gv[0]
-        ws1.cell(row=row, column=145, value=round(float(next_gv0), 6))
-        ws1.cell(row=row, column=146, value=round(float(gv.sum()), 6))
-        ws1.cell(row=row, column=147, value=round(float(price_avg @ gv), 6))
+            ws.cell(row=row, column=col, value=round(float(gv[col - 1]), 6))
+        next_gv0 = results[i + 1][key][0] if i + 1 < n_days else gv[0]
+        ws.cell(row=row, column=145, value=round(float(next_gv0), 6))
+        ws.cell(row=row, column=146, value=round(float(gv.sum()), 6))
+        ws.cell(row=row, column=147, value=round(float(price_avg @ gv), 6))
 
-    # ---------- Sheet2: 充放电量 ----------
-    ws2 = wb["充放电量"]
-    if ws2.max_row > 1:
-        ws2.delete_rows(2, ws2.max_row - 1)
+
+def _fill_charge_sheet(ws, results, export_start_idx, export_end_idx, c_key="cv", d_key="dv", soc_key="socv"):
+    if ws.max_row > 1:
+        ws.delete_rows(2, ws.max_row - 1)
     row = 2
     for i in range(export_start_idx, export_end_idx + 1):
         r = results[i]
-        cv, dv, socv = r["cv"], r["dv"], r["socv"]
+        cv, dv, socv = r[c_key], r[d_key], r[soc_key]
         date_obj = dt.datetime.strptime(r["date"], "%Y-%m-%d")
         for bi, (label, a, b) in enumerate(TBL2):
-            ws2.cell(row=row, column=1, value=date_obj if bi == 0 else None)
-            ws2.cell(row=row, column=2, value=label)
-            ws2.cell(row=row, column=3, value=round(float(cv[a:b].sum()), 6))
-            ws2.cell(row=row, column=4, value=round(float(dv[a:b].sum()), 6))
+            ws.cell(row=row, column=1, value=date_obj if bi == 0 else None)
+            ws.cell(row=row, column=2, value=label)
+            ws.cell(row=row, column=3, value=round(float(cv[a:b].sum()), 6))
+            ws.cell(row=row, column=4, value=round(float(dv[a:b].sum()), 6))
             if bi == 0:
-                ws2.cell(row=row, column=5, value=dt.time(0, 0))
-                ws2.cell(row=row, column=6, value=round(float(socv[0]), 6))
+                ws.cell(row=row, column=5, value=dt.time(0, 0))
+                ws.cell(row=row, column=6, value=round(float(socv[0]), 6))
             elif bi == 1:
-                ws2.cell(row=row, column=5, value="24:00")
-                ws2.cell(row=row, column=6, value=round(float(socv[-1]), 6))
+                ws.cell(row=row, column=5, value="24:00")
+                ws.cell(row=row, column=6, value=round(float(socv[-1]), 6))
             row += 1
 
-    # ---------- Sheet3: 紧急购电量 ----------
-    ws3 = wb["紧急购电量"]
-    if ws3.max_row > 1:
-        ws3.delete_rows(2, ws3.max_row - 1)
+
+def _fill_emergency_sheet(ws, results, export_start_idx, export_end_idx, deficit_key="deficit_e"):
+    if ws.max_row > 1:
+        ws.delete_rows(2, ws.max_row - 1)
     row = 2
     for i in range(export_start_idx, export_end_idx + 1):
         r = results[i]
-        segs = merge_deficit_segments(r["deficit_e"])
+        segs = merge_deficit_segments(r[deficit_key])
         if not segs:
             continue
         date_obj = dt.datetime.strptime(r["date"], "%Y-%m-%d")
         for si, (s, e, val) in enumerate(segs):
-            ws3.cell(row=row, column=1, value=date_obj if si == 0 else None)
-            ws3.cell(row=row, column=2, value=time_range_str(s)[:5] + "-" + time_range_str(e - 1)[6:])
-            ws3.cell(row=row, column=3, value=round(float(val), 6))
+            ws.cell(row=row, column=1, value=date_obj if si == 0 else None)
+            ws.cell(row=row, column=2, value=time_range_str(s)[:5] + "-" + time_range_str(e - 1)[6:])
+            ws.cell(row=row, column=3, value=round(float(val), 6))
             row += 1
 
+
+def export_result2_template(template_file, out_file, results, export_start_idx, export_end_idx,
+                             price_avg, n_days):
+    from openpyxl import load_workbook
+    wb = load_workbook(template_file)
+    _fill_purchase_sheet(wb["计划购电量"], results, "gv", export_start_idx, export_end_idx, price_avg, n_days)
+    _fill_charge_sheet(wb["充放电量"], results, export_start_idx, export_end_idx)
+    _fill_emergency_sheet(wb["紧急购电量"], results, export_start_idx, export_end_idx)
+    wb.save(out_file)
+
+
+def export_result3_template(template_file, out_file, results, export_start_idx, export_end_idx,
+                             price_avg, n_days):
+    """问题3专用：多一张"调整购电量"sheet（其余三张与result2同格式）。
+    results[i] 需含：g_plan（0点计划）、g_final（最终执行/调整后）、
+    cv/dv/socv（最终充放电与储电量轨迹）、deficit_e（实时缺口）。"""
+    from openpyxl import load_workbook
+    wb = load_workbook(template_file)
+    _fill_purchase_sheet(wb["计划购电量"], results, "g_plan", export_start_idx, export_end_idx, price_avg, n_days)
+    _fill_purchase_sheet(wb["调整购电量"], results, "g_final", export_start_idx, export_end_idx, price_avg, n_days)
+    _fill_charge_sheet(wb["充放电量"], results, export_start_idx, export_end_idx)
+    _fill_emergency_sheet(wb["紧急购电量"], results, export_start_idx, export_end_idx)
     wb.save(out_file)
 
 
@@ -354,7 +484,7 @@ def build_summary_report(header_lines, results, dates_str, export_start_idx, exp
 
 
 def plot_representative_days(results, dates_str, price_raw, out_dir, title_prefix="问题2",
-                              rep_dates=REP_DATES):
+                              rep_dates=REP_DATES, file_prefix="plot"):
     import matplotlib.pyplot as plt
     try:
         plt.rcParams["font.sans-serif"] = ["SimHei", "Microsoft YaHei", "DejaVu Sans"]
@@ -388,7 +518,7 @@ def plot_representative_days(results, dates_str, price_raw, out_dir, title_prefi
         ax[2].set_ylabel("储电量 (kWh)")
         ax[2].set_xlabel("时刻 (h)")
         fig.tight_layout()
-        out_png = Path(out_dir) / f"problem2_plot_{rd.replace('-', '')}.png"
+        out_png = Path(out_dir) / f"{file_prefix}_{rd.replace('-', '')}.png"
         fig.savefig(out_png, dpi=150)
         plt.close(fig)
         saved.append(out_png)

@@ -231,7 +231,8 @@ def main():
 
     # ---------- 代表日画图 ----------
     try:
-        saved = dac.plot_representative_days(results, dates_str, price_raw, outdir, title_prefix="问题2(LightGBM)")
+        saved = dac.plot_representative_days(results, dates_str, price_raw, outdir, title_prefix="问题2(LightGBM)",
+                                              file_prefix="problem2_plot")
         for p in saved:
             print(f"[作图] 已保存: {p}")
     except Exception as e:
