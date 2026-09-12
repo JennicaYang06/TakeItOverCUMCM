@@ -1,47 +1,30 @@
 """
-问题3：0:00制定计划购电，6:00/12:00/18:00根据新光伏预报调整购电（全年滚动仿真）。
+问题3 第二版：负荷预测换成 LightGBM 逐日滚动重训（特征/训练逻辑复用 forecast_lightgbm_最终版.py）。
 
-与问题2的区别：
-  1. 光伏预测不再自己建模——附件3直接给出每天0:00/6:00/12:00/18:00发布的"未来24小时整点"
-     光伏预报，问题3只需要把这些整点预报插值到10分钟粒度即可。负荷没有对应的日内预报，
-     仍用 day_ahead_common.LoadForecaster（Holt-Winters）在0:00做一次预测，全天不再修正。
-  2. 0:00用全天(144格)的0点光伏预报解出"计划购电量" g_plan——这是问题2同款的日前MILP
-     （见 day_ahead_common.DayAheadMILP），结果既是对外报告的"计划"，也是后续调整费用的基准。
-  3. 6:00/12:00/18:00各自用新预报重新决策"剩余一整天"（不是只决策接下来6小时！），但只把
-     "接下来6小时=36格"锁定为最终执行结果，其余格子只是这次求解里的预览、马上会被下一次
-     调整覆盖。这么做是因为最初按"只优化接下来6小时"实现时，实测储能会被过度放空：
-     调整量比计划少的部分能按0.5倍价格"抵扣"（见下），只要供需平衡不等式仍满足，模型就有
-     动机不计代价地多放电、少买电去薅这个折扣，而单段优化看不到"后面几段还要不要用这些电"，
-     于是每段都在放空电池，反而把后面时段的缺口越掏越大。把优化范围扩到"到24:00为止"以后，
-     储能递推约束贯穿整个剩余时段，模型才会意识到"现在放太多、后面会不够"，不再无脑放电。
-     负荷目标仍是0点那版预测（只在真正锁定的36格上叠加报童安全边际，预览部分不加，因为
-     预览部分反正会被重新决策，不需要现在就买安全垫）。
-     每段调整以"上一段实际执行完的储电量"为起点，最终执行值与0点计划的差额：
-       调整量 > 计划量的部分，超出部分按1.5倍价格多付；
-       调整量 < 计划量的部分，少买的部分按0.5倍价格计入违约金
-       （即比照单纯不调整"多付计划价"能省下0.5倍价格——细节推导见 SegmentMILP 的类注释）。
-  4. 一天结束后用附件2真实值回代最终执行的 g/c/d：供给仍不够的部分按5倍价紧急购电（与问题2相同）。
-  5. 总费用 = 计划购电费(price*g_plan) + 调整相关费用(各段SegmentMILP目标值之和) + 紧急购电费。
-  6. 全年从2025-1-1（SOC0=6000）跑起，1月做负荷预测模型的历史预热，只导出2025-2-1~12-31。
-  7. 提供 --no-adjustment 开关：只执行0点计划、不做任何日内调整，用于和"有调整"对比，
-     回答题目"是否需要引入其他时刻的预报制定调整购电策略"。
+光伏依然直接用附件3的官方预报（题目给定，不存在"选什么方法预测光伏"的问题），所以这一版
+和 problem3.py 唯一的区别就是负荷预测方法：Holt-Winters -> LightGBM。其余部分——0点计划
+MILP、6:00/12:00/18:00对"剩余一整天"联合重优化但只锁定接下来6小时、报童安全边际、
+紧急购电结算、result3.xlsx导出——完全复用 problem3.py 里已经验证过的逻辑和常量
+（EPOCHS/LOCK_LEN 直接从 problem3 导入），day_ahead_common.py 不做任何改动。
+
+LightGBM部分只训练"load"这一个目标，复用 forecast_lightgbm_最终版.py 的特征工程
+（时间周期项sin/cos + 该时刻自身滞后1/2/3天 + 7/14日滑动均值）和逐日滚动重训逻辑
+（用当天之前的全部历史训练，历史不足约15天时退化为"前一天实际值"兜底）。
 """
-import argparse
+
 import time
 from pathlib import Path
-
 import numpy as np
 import pandas as pd
 
-import day_ahead_common as dac
+import day_ahead_common1 as dac
+from forecast_lightgbm_最终版 import read_attachment2, add_features, add_lags, train_predict_one_day
 
 DT = dac.DT
 T = dac.T
 
-LOCK_LEN = 36                     # 每次调整只锁定接下来6小时=36格为最终结果
-EPOCHS = [("6:00", 36), ("12:00", 72), ("18:00", 108)]   # (预报发布时刻, 该时刻对应的块起点)
-
-
+LOCK_LEN = 72                     # 每次调整只锁定接下来6小时=36格为最终结果
+EPOCHS = [("12:00", 72)]   # (预报发布时刻, 该时刻对应的块起点)
 # ======================= 读取附件3：光伏预报（每天0/6/12/18点各一条，未来24小时整点） =======================
 def read_attachment3(path: Path):
     raw = pd.read_excel(path, header=0)
@@ -54,29 +37,17 @@ def read_attachment3(path: Path):
     lookup = {}
     for d, idx in pd.Series(date_str).groupby(date_str).groups.items():
         rows = raw.loc[idx, hourly_cols].to_numpy(dtype=float)
-        assert rows.shape[0] == 4, f"{d} 应有4条预报(0/6/12/18点)，实际 {rows.shape[0]}"
-        lookup[d] = {"0:00": rows[0], "6:00": rows[1], "12:00": rows[2], "18:00": rows[3]}
+        assert rows.shape[0] == 4, f"{d} 应有2条预报(0/12点)，实际 {rows.shape[0]}"
+        lookup[d] = {"0:00": rows[0], "12:00": rows[2],}
     return lookup
 
-
 def main():
-    ap = argparse.ArgumentParser(description=__doc__)
-    ap.add_argument("--start", default=dac.EXPORT_START)
-    ap.add_argument("--end", default=dac.EXPORT_END)
-    ap.add_argument("--debug-days", type=int, default=None, help="调试：仅仿真前N天")
-    ap.add_argument("--no-adjustment", action="store_true",
-                     help="关闭6/12/18点的日内调整，只执行0点计划（用于对比是否需要调整）")
-    ap.add_argument("--no-safety-margin", action="store_true", help="关闭报童安全边际")
-    ap.add_argument("--outdir", default=None, help="输出目录，默认 results/problem3")
-    args = ap.parse_args()
-
-    use_adjustment = not args.no_adjustment
-    use_safety_margin = not args.no_safety_margin
-
+    use_safety_margin = True
+    use_adjustment = True
     here = Path(__file__).resolve().parent
     root, data_dir, template_dir = dac.resolve_data_dirs(here)
-    tag = "with_adjustment" if use_adjustment else "no_adjustment"
-    outdir = Path(args.outdir) if args.outdir else root / "results" / "problem3" / tag
+    tag = "0_12_adjustment" if use_adjustment else "no_adjustment"
+    outdir = root / "results" / "problem3_lightgbm" / tag
     outdir.mkdir(parents=True, exist_ok=True)
 
     print(f"[数据目录] {data_dir}")
@@ -90,40 +61,46 @@ def main():
     dates_str = pack["dates_str"]
     load_kw_all, pv_kw_all = pack["load_kw_all"], pack["pv_kw_all"]
     n_days_total = pack["n_days"]
+    all_dates = pd.to_datetime(dates_str)
+
+    print("准备读取附件2构造负荷LightGBM特征表 ...")
+    data = read_attachment2(data_dir / "附件2.xlsx")
+    data = add_features(data)
+    data = add_lags(data, "load")
+    print(f"特征表构造完成: {len(data)} 行")
 
     print("准备读取附件3光伏预报 ...")
     pv_forecast_lookup = read_attachment3(data_dir / "附件3.xlsx")
-    print(f"附件3读取完成: {len(pv_forecast_lookup)} 天 x 4次预报/天")
+    print(f"附件3读取完成: {len(pv_forecast_lookup)} 天 x 2次预报/天")
 
-    n_days = min(n_days_total, args.debug_days) if args.debug_days else n_days_total
-    if args.debug_days:
-        print(f"[调试模式] 仅仿真前 {n_days} 天")
+    n_days = n_days_total
+    print(f"[调试模式] 仅仿真前 {n_days} 天")
 
     export_start_idx, export_end_idx, do_export = dac.compute_export_range(
-        dates_str, n_days, export_start=args.start, export_end=args.end)
+        dates_str, n_days, export_start="2025-02-01", export_end="2025-12-31")
     if not do_export:
         print(f"[调试模式] n_days={n_days} 未覆盖导出起点，跳过导出")
-    print(f"[导出区间] {args.start} (day_idx={export_start_idx}) ~ {args.end} (day_idx={export_end_idx})")
+    print(f"[导出区间] 2025-02-01 (day_idx={export_start_idx}) ~ 2025-12-31 (day_idx={export_end_idx})")
 
     day_milp = dac.DayAheadMILP(price_avg)
-    # 每个调整时刻对应的"剩余时段"MILP：6点(剩108格)/12点(剩72格)/18点(剩36格)，尺寸不同各建一个。
     seg_milps = {start: dac.SegmentMILP(T - start) for _, start in EPOCHS}
-    load_forecaster = dac.LoadForecaster(load_kw_seed)
     net_error_tracker = dac.NetErrorTracker(T)
-    # 每个调整时刻各自的"锁定的那36格"净负荷预测误差滚动分位数，不能和0点(24小时视距)那条
-    # 共用——视距越短预报通常越准，误差分布也越小，用同一条会把24小时视距算出的大边际
-    # 错误地叠加到6小时视距的调整上（详见上面 problem3.py 顶部注释里的踩坑记录）。
     seg_error_trackers = {start: dac.NetErrorTracker(LOCK_LEN) for _, start in EPOCHS}
 
     soc_prev_end = dac.SOC0_INIT
     results = []
+    n_fallback = 0
     t_start = time.time()
 
     for day_idx in range(n_days):
         date_str = dates_str[day_idx]
+        day = all_dates[day_idx]
 
-        # ---------- 0点：负荷预测 + 附件3的0点光伏预报 -> 全天计划 ----------
-        f_load_kw = load_forecaster.predict(day_idx)
+        # ---------- 0点：LightGBM负荷预测 + 附件3的0点光伏预报 -> 全天计划 ----------
+        f_load_kw = train_predict_one_day(data, day, "load", 100)
+        if f_load_kw is None:
+            f_load_kw = (load_kw_all[day_idx - 1] if day_idx > 0 else load_kw_seed).copy()
+            n_fallback += 1
         f_load_e_full = dac.adjacent_average(f_load_kw) * DT
 
         anchor0 = pv_kw_all[day_idx - 1, -1] if day_idx > 0 else 0.0
@@ -136,13 +113,13 @@ def main():
 
         g_plan, c_plan, d_plan, soc_plan = day_milp.solve(soc_prev_end, f_load_e_target_full, f_pv_e_full)
 
-        # ---------- 6:00/12:00/18:00：每次都对"剩余一整天"重新优化，只锁定接下来36格 ----------
+        # ---------- 6:00/12:00/18:00：对"剩余一整天"联合重优化，只锁定接下来36格 ----------
         g_final = g_plan.copy()
         c_final = c_plan.copy()
         d_final = d_plan.copy()
-        soc_pieces = [soc_plan[0:37]]          # 0:00-6:00 直接沿用计划
-        current_soc = float(soc_plan[36])
-        seg_lock_pv_e = {}                     # start -> 锁定36格的光伏预测，留着结算后更新tracker
+        soc_pieces = [soc_plan[0:73]]
+        current_soc = float(soc_plan[72])
+        seg_lock_pv_e = {}
 
         for issue, start in EPOCHS:
             if not use_adjustment:
@@ -198,7 +175,6 @@ def main():
         ))
 
         f_net_e_full = f_load_e_full - f_pv_e_full
-        load_forecaster.update(day_idx, actual_load_kw)
         net_error_tracker.update(f_net_e_full, actual_net_e)
         if use_adjustment:
             for issue, start in EPOCHS:
@@ -209,9 +185,10 @@ def main():
 
         if day_idx % 30 == 0 or day_idx == n_days - 1:
             print(f"[{day_idx + 1}/{n_days}] {date_str}  计划={plan_cost:8.2f}  "
-                  f"调整={adjustment_cost:8.2f}  紧急={emerg_cost:8.2f}  soc_end={soc_prev_end:8.1f}")
+                f"调整={adjustment_cost:8.2f}  紧急={emerg_cost:8.2f}  soc_end={soc_prev_end:8.1f}")
 
     print(f"\n仿真完成，用时 {time.time() - t_start:.1f}s")
+    print(f"负荷LightGBM冷启动回退天数: {n_fallback}（历史有效训练样本 < 100 行时用前一天实际值兜底）")
 
     # ---------- 导出 result3.xlsx ----------
     try:
@@ -220,7 +197,7 @@ def main():
         template_file = template_dir / "result3.xlsx"
         out_file = outdir / "result3.xlsx"
         dac.export_result3_template(template_file, out_file, results, export_start_idx, export_end_idx,
-                                     price_avg, n_days)
+                                    price_avg, n_days)
         print(f"\n[模板填充] 已写入: {out_file}")
     except Exception as e:
         print(f"[提示] 未写入 result3.xlsx: {e}")
@@ -245,20 +222,20 @@ def main():
 
     lines = []
     lines.append("=" * 70)
-    lines.append("问题3  结果汇总")
+    lines.append("问题3(负荷预测=LightGBM)  结果汇总")
     lines.append("=" * 70)
     lines.append(f"求解器: {dac.SOLVER}  (ETA_C={dac.ETA_C:.4f}, ETA_D={dac.ETA_D:.4f})")
-    lines.append("光伏预测: 直接使用附件3官方预报(0/6/12/18点发布，整点值线性插值到10分钟)")
-    lines.append("负荷预测: Holt-Winters(0点做一次，全天不修正，附件3不提供负荷预报)")
-    lines.append(f"日内调整: {'开启（6/12/18点各调整接下来6小时）' if use_adjustment else '关闭（只执行0点计划）'}")
+    lines.append("光伏预测: 直接使用附件3官方预报(0/12点发布，整点值线性插值到10分钟)")
+    lines.append("负荷预测: LightGBM 逐日滚动重训（特征=时间周期项sin/cos + 滞后1/2/3天 + 7/14日滑动均值）")
+    lines.append(f"日内调整: {'开启（12点联合剩余日重优化，只锁定接下来12小时）' if use_adjustment else '关闭（只执行0点计划）'}")
     lines.append(f"安全边际: {'启用 q=' + str(dac.SAFETY_QUANTILE) if use_safety_margin else '未启用'}")
     lines.append("")
-    lines.append(f"预测误差（{args.start}~{args.end}，0点预报口径）")
+    lines.append(f"预测误差（2025-02-01~2025-12-31，0点预报口径）")
     lines.append("-" * 70)
     lines.append(f"  负荷  MAE={load_mae:8.2f} kW   RMSE={load_rmse:8.2f} kW   MAPE={load_mape:6.2f}%")
     lines.append(f"  光伏  MAE={pv_mae:8.2f} kW   RMSE={pv_rmse:8.2f} kW   MAPE(出力>50kW)={pv_mape:6.2f}%")
     lines.append("")
-    lines.append(f"全年费用（{args.start}~{args.end}，{len(exp_slice)}天）")
+    lines.append(f"全年费用（2025-02-01~2025-12-31，{len(exp_slice)}天）")
     lines.append("-" * 70)
     lines.append(f"  计划购电费合计   = {total_plan:12.2f} 元")
     lines.append(f"  调整相关费用合计 = {total_adj:12.2f} 元  （正=多付1.5倍溢价，负=少买省下0.5倍价）")
@@ -317,7 +294,7 @@ def main():
     # ---------- 代表日画图 ----------
     try:
         saved = dac.plot_representative_days(results, dates_str, price_raw, outdir,
-                                              title_prefix="问题3(计划vs调整)", file_prefix="problem3_plot")
+                                            title_prefix="问题3(LightGBM负荷)", file_prefix="problem3_plot")
         for p in saved:
             print(f"[作图] 已保存: {p}")
     except Exception as e:
