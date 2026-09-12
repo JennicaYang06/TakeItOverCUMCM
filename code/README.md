@@ -138,7 +138,36 @@ python code/problem3.py --no-safety-margin # 关掉报童安全边际
 需要——用1.5倍/0.5倍的温和调整价格去替换本该发生的5倍紧急购电价格，紧急购电费降了约1/3，
 换来的调整净支出很小（只有2.6万），全年总费用降了约2.3%。
 
-## `day_ahead_common.py`：三版共用的基础设施
+### 版本B：`problem3_lightgbm.py`（负荷预测换成 LightGBM）
+
+```powershell
+python code/problem3_lightgbm.py                    # 全年，开启日内调整
+python code/problem3_lightgbm.py --no-adjustment     # 全年，关闭调整
+python code/problem3_lightgbm.py --debug-days 40     # 调试
+```
+
+光伏依然直接用附件3官方预报（题目给定，两版没有分歧），唯一的区别是负荷预测方法：
+`problem3.py` 用 Holt-Winters，这一版换成 `forecast_lightgbm_最终版.py` 同款的逐日滚动
+重训LightGBM（只训练"load"一个目标，比问题2的LightGBM版快一倍）。0点计划MILP、
+6/12/18点联合剩余日重优化、报童安全边际、紧急购电结算、result3.xlsx导出完全复用
+`problem3.py` 里的常量和 `day_ahead_common.py`，没有改动共用模块。输出到
+`results/problem3_lightgbm/{with_adjustment,no_adjustment}/`。
+
+### 四种组合的全年对比（2025.2.1-12.31，334天，均已启用安全边际）
+
+| | Holt-Winters, 只计划 | Holt-Winters, 有调整 | LightGBM, 只计划 | LightGBM, 有调整 |
+| --- | --- | --- | --- | --- |
+| 负荷 MAPE | 3.23% | 3.23% | 3.06% | 3.06% |
+| 计划购电费 | 1321.0万 | 1321.0万 | 1306.7万 | 1306.7万 |
+| 调整相关费用 | 0 | 2.6万 | 0 | -0.1万 |
+| 紧急购电费 | 104.6万 | 69.5万 | 109.8万 | 73.2万 |
+| **总费用** | **1425.6万** | **1393.1万** | **1416.5万** | **1379.8万** |
+
+两个维度的收益基本正交：LightGBM负荷预测比Holt-Winters略准（3.06%对3.23%），带来约
+0.6%-1%的总费用下降；加日内调整再省2.3%-2.6%；两者叠加起来最省（LightGBM+有调整
+全年1379.8万，是四种组合里最低的，比最基础的"Holt-Winters只计划"低约3.2%）。
+
+## `day_ahead_common.py`：各版共用的基础设施
 
 - `DayAheadMILP`：单日 MILP（cvxpy Parameter 化，编译一次、365天复用求解）。
 - `SegmentMILP`：问题3的日内调整MILP，任意段长可复用（问题3按108/72/36三种剩余长度各建一个）。
