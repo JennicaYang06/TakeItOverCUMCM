@@ -1,8 +1,21 @@
 # -*- coding: utf-8 -*-
 """
 问题4（对应问题3部分）：波动电价下的"0点计划+日内调整"购电策略——LightGBM负荷预测，
-光伏用附件3官方预报，日内调整逻辑与 problem3_lightgbm-0点6点12点18点.py 一致，
+光伏用附件3官方预报，日内调整逻辑与之前问题3的4点/2点版一致，
 只是电价换成附件4的"每天一条、365天各不相同"波动电价。
+
+重要修正（和 problem4_2.py 同一个坑）：电价"实时波动"意味着0点、以及6/12/18点做调整时，
+当天剩余时段的真实电价都是未知的，不能直接拿附件4当天的真实电价去解MILP——那等于运营商
+提前精确知道电价，不成立。所以：
+  - 0点计划、6/12/18点调整，两层MILP的目标函数都必须用"电价预测"。预测方法和负荷/光伏
+    保持一致，用 LightGBM 逐日滚动重训（不用 Holt-Winters——问题2、问题3全线都用
+    LightGBM，电价没有理由例外），0点做一次，全天不再修正（没有类似附件3那样的官方电价
+    日内更新数据源，没必要为电价单独建一个"6/12/18点重新预测"的机制，徒增复杂度且没有
+    数据支撑）。特征工程和训练函数直接复用 problem2_lightgbm.py（`add_features`/
+    `add_lags`/`train_predict_one_day` 本来就是按列名参数化的通用函数），只是往
+    `FEATURES` 字典里运行时挂一条"price"的特征列表（不编辑 problem2_lightgbm.py 源文件）。
+  - 结算（计划购电费、调整相关费用、紧急购电费、result4-3.xlsx里的"全天购电费"）一律用
+    附件4当天的*真实*电价——账单按真实发生的电价算，不管当初预测的是多少。
 
 和 problem4_2.py 同样的理由：day_ahead_common.py 里 export_result3_template /
 build_summary_report 假设全年一条价格，不能直接拿来处理附件4，这里自己写导出/汇总逻辑
@@ -24,8 +37,13 @@ import numpy as np
 import pandas as pd
 
 import day_ahead_common as dac
-from problem2_lightgbm import add_features, add_lags, train_predict_one_day
-from problem4_2 import read_attachment4_price, export_purchase_sheet_perday
+from problem2_lightgbm import add_features, add_lags, train_predict_one_day, FEATURES
+from problem4_2 import read_attachment4_price, read_attachment4_long, export_purchase_sheet_perday
+
+# 挂载电价的特征列表（和 problem4_2.py 用的是同一个 FEATURES 字典，这里重复赋值一次是
+# 无害的，两个脚本谁先跑都一样；不编辑 problem2_lightgbm.py 源文件）。
+FEATURES["price"] = ["t", "hour", "dow", "month", "doy", "sin_doy", "cos_doy", "sin_t", "cos_t",
+                      "price_lag1", "price_lag2", "price_lag3", "price_mean7", "price_mean14"]
 
 DT = dac.DT
 T = dac.T
@@ -75,8 +93,10 @@ def read_attachment3(path: Path):
 def export_result4_3_template(template_file, out_file, results, export_start_idx, export_end_idx, n_days):
     from openpyxl import load_workbook
     wb = load_workbook(template_file)
-    export_purchase_sheet_perday(wb["计划购电量"], results, "g_plan", export_start_idx, export_end_idx, n_days)
-    export_purchase_sheet_perday(wb["调整购电量"], results, "g_final", export_start_idx, export_end_idx, n_days)
+    export_purchase_sheet_perday(wb["计划购电量"], results, "g_plan", "price_actual_avg",
+                                  export_start_idx, export_end_idx, n_days)
+    export_purchase_sheet_perday(wb["调整购电量"], results, "g_final", "price_actual_avg",
+                                  export_start_idx, export_end_idx, n_days)
     dac._fill_charge_sheet(wb["充放电量"], results, export_start_idx, export_end_idx)
     dac._fill_emergency_sheet(wb["紧急购电量"], results, export_start_idx, export_end_idx)
     wb.save(out_file)
@@ -137,6 +157,12 @@ def main():
     pv_forecast_lookup = read_attachment3(data_dir / "附件3.xlsx")
     print(f"附件3读取完成: {len(pv_forecast_lookup)} 天 x 4次预报/天")
 
+    print("准备读取附件4构造电价 LightGBM 特征表 ...")
+    price_data = read_attachment4_long(data_dir / "附件4.xlsx")
+    price_data = add_features(price_data)
+    price_data = add_lags(price_data, "price")
+    print(f"电价特征表构造完成: {len(price_data)} 行")
+
     n_days = min(n_days_total, args.debug_days) if args.debug_days else n_days_total
     if args.debug_days:
         print(f"[调试模式] 仅仿真前 {n_days} 天")
@@ -153,22 +179,26 @@ def main():
 
     soc_prev_end = dac.SOC0_INIT
     results = []
-    n_fallback = 0
+    n_fallback = {"load": 0, "price": 0}
     t_start = time.time()
 
     for day_idx in range(n_days):
         date_str = dates_str[day_idx]
         day = all_dates[day_idx]
 
-        price_raw_day = price_kw_all[day_idx]
-        price_avg_day = dac.adjacent_average(price_raw_day)
-        day_milp = dac.DayAheadMILP(price_avg_day)   # 电价天天不同，只能每天重新构建
+        # ---------- 电价预测：0点/调整时都不知道真实电价，用LightGBM预测（和负荷同款套路） ----------
+        f_price_kw = train_predict_one_day(price_data, day, "price", args.min_train_rows)
+        if f_price_kw is None:
+            f_price_kw = (price_kw_all[day_idx - 1] if day_idx > 0 else price_kw_all[0]).copy()
+            n_fallback["price"] += 1
+        f_price_avg = dac.adjacent_average(f_price_kw)
+        day_milp = dac.DayAheadMILP(f_price_avg)   # 电价预测天天更新，只能每天重新构建
 
         # ---------- 0点：LightGBM负荷预测 + 附件3的0点光伏预报 -> 全天计划 ----------
         f_load_kw = train_predict_one_day(data, day, "load", args.min_train_rows)
         if f_load_kw is None:
             f_load_kw = (load_kw_all[day_idx - 1] if day_idx > 0 else load_kw_seed).copy()
-            n_fallback += 1
+            n_fallback["load"] += 1
         f_load_e_full = dac.adjacent_average(f_load_kw) * DT
 
         anchor0 = pv_kw_all[day_idx - 1, -1] if day_idx > 0 else 0.0
@@ -207,7 +237,7 @@ def main():
             load_seg_target[:LOCK_LEN] = np.clip(load_seg_target[:LOCK_LEN] + margin_lock, 0.0, None)
 
             g_adj, c_seg, d_seg, soc_seg, _ = seg_milps[start].solve(
-                current_soc, load_seg_target, pv_seg_e, g_plan[start:T], price_avg_day[start:T])
+                current_soc, load_seg_target, pv_seg_e, g_plan[start:T], f_price_avg[start:T])
 
             g_final[start:start + LOCK_LEN] = g_adj[:LOCK_LEN]
             c_final[start:start + LOCK_LEN] = c_seg[:LOCK_LEN]
@@ -217,26 +247,29 @@ def main():
             seg_lock_pv_e[start] = pv_seg_e[:LOCK_LEN]
 
         soc_final = np.concatenate(soc_pieces)
-        up = np.clip(g_final - g_plan, 0.0, None)
-        down = np.clip(g_plan - g_final, 0.0, None)
-        adjustment_cost = float(np.sum(price_avg_day * (1.5 * up - 0.5 * down)))
 
-        # ---------- 结算：真实负荷/光伏回代 ----------
+        # ---------- 结算：真实负荷/光伏/电价回代，账单按真实电价算 ----------
+        actual_price_raw = price_kw_all[day_idx]
+        actual_price_avg = dac.adjacent_average(actual_price_raw)
         actual_load_kw = load_kw_all[day_idx]
         actual_pv_kw = pv_kw_all[day_idx]
         actual_load_e = dac.adjacent_average(actual_load_kw) * DT
         actual_pv_e = dac.adjacent_average(actual_pv_kw) * DT
         actual_net_e = actual_load_e - actual_pv_e
 
-        deficit_e, _, emerg_cost = dac.settle_day(g_final, c_final, d_final, actual_load_e, actual_pv_e, price_avg_day)
-        plan_cost = float(price_avg_day @ g_plan)
+        up = np.clip(g_final - g_plan, 0.0, None)
+        down = np.clip(g_plan - g_final, 0.0, None)
+        adjustment_cost = float(np.sum(actual_price_avg * (1.5 * up - 0.5 * down)))
+
+        deficit_e, _, emerg_cost = dac.settle_day(g_final, c_final, d_final, actual_load_e, actual_pv_e, actual_price_avg)
+        plan_cost = float(actual_price_avg @ g_plan)
         total_cost = plan_cost + adjustment_cost + emerg_cost
 
         results.append(dict(
             day_idx=day_idx, date=date_str,
             g_plan=g_plan, g_final=g_final, gv=g_final,
             cv=c_final, dv=d_final, socv=soc_final,
-            price_raw=price_raw_day, price_avg=price_avg_day,
+            price_raw=actual_price_raw, price_actual_avg=actual_price_avg, f_price_kw=f_price_kw,
             f_load_kw=f_load_kw, f_pv_kw=pv0_kw,
             actual_load_kw=actual_load_kw, actual_pv_kw=actual_pv_kw,
             deficit_e=deficit_e, plan_cost=plan_cost, adjustment_cost=adjustment_cost,
@@ -257,7 +290,7 @@ def main():
                   f"调整={adjustment_cost:8.2f}  紧急={emerg_cost:8.2f}  soc_end={soc_prev_end:8.1f}")
 
     print(f"\n仿真完成，用时 {time.time() - t_start:.1f}s")
-    print(f"负荷LightGBM冷启动回退天数: {n_fallback}")
+    print(f"冷启动回退天数: load={n_fallback['load']}  price={n_fallback['price']}")
 
     # ---------- 导出 result4-3.xlsx ----------
     try:
@@ -278,8 +311,11 @@ def main():
     a_load_mat = np.array([r["actual_load_kw"] for r in exp_slice])
     f_pv_mat = np.array([r["f_pv_kw"] for r in exp_slice])
     a_pv_mat = np.array([r["actual_pv_kw"] for r in exp_slice])
+    f_price_mat = np.array([r["f_price_kw"] for r in exp_slice])
+    a_price_mat = np.array([r["price_raw"] for r in exp_slice])
     load_mae, load_rmse, load_mape = dac.error_metrics(f_load_mat, a_load_mat)
     pv_mae, pv_rmse, pv_mape = dac.error_metrics(f_pv_mat, a_pv_mat, mape_thresh=50.0)
+    price_mae, price_rmse, price_mape = dac.error_metrics(f_price_mat, a_price_mat)
 
     total_plan = sum(r["plan_cost"] for r in exp_slice)
     total_adj = sum(r["adjustment_cost"] for r in exp_slice)
@@ -293,9 +329,9 @@ def main():
     lines.append("问题4(对应问题3，波动电价)  结果汇总")
     lines.append("=" * 70)
     lines.append(f"求解器: {dac.SOLVER}  (ETA_C={dac.ETA_C:.4f}, ETA_D={dac.ETA_D:.4f})")
-    lines.append("电价: 附件4波动电价（每天一条144点曲线，逐日不同）")
+    lines.append("电价: 附件4波动电价，0点用LightGBM预测决策，结算用当天真实值")
     lines.append("光伏预测: 直接使用附件3官方预报，整点值线性插值到10分钟")
-    lines.append("负荷预测: LightGBM 逐日滚动重训")
+    lines.append("负荷/电价预测: LightGBM 逐日滚动重训")
     if use_adjustment:
         issue_desc = "、".join(issue for issue, _ in EPOCHS)
         lines.append(f"日内调整: 开启（{issue_desc}联合剩余日重优化，只锁定接下来{LOCK_LEN * 10}分钟）")
@@ -307,8 +343,9 @@ def main():
     lines.append("-" * 70)
     lines.append(f"  负荷  MAE={load_mae:8.2f} kW   RMSE={load_rmse:8.2f} kW   MAPE={load_mape:6.2f}%")
     lines.append(f"  光伏  MAE={pv_mae:8.2f} kW   RMSE={pv_rmse:8.2f} kW   MAPE(出力>50kW)={pv_mape:6.2f}%")
+    lines.append(f"  电价  MAE={price_mae:8.4f} 元/kWh RMSE={price_rmse:8.4f} 元/kWh MAPE={price_mape:6.2f}%")
     lines.append("")
-    lines.append(f"全年费用（{args.start}~{args.end}，{len(exp_slice)}天）")
+    lines.append(f"全年费用（{args.start}~{args.end}，{len(exp_slice)}天，按真实电价结算）")
     lines.append("-" * 70)
     lines.append(f"  计划购电费合计   = {total_plan:12.2f} 元")
     lines.append(f"  调整相关费用合计 = {total_adj:12.2f} 元  （正=多付1.5倍溢价，负=少买省下0.5倍价）")
@@ -324,7 +361,7 @@ def main():
             continue
         r = results[idx]
         g_plan, g_final, cv, dv, socv, deficit_e = r["g_plan"], r["g_final"], r["cv"], r["dv"], r["socv"], r["deficit_e"]
-        price_avg_day = r["price_avg"]
+        price_actual_avg = r["price_actual_avg"]
         lines.append("=" * 70)
         lines.append(f"代表日 {rd}")
         lines.append("=" * 70)
@@ -332,13 +369,13 @@ def main():
         for name, t in dac.TBL1:
             lines.append(f"  {name:<14s} {g_plan[t]:12.4f}")
         lines.append(f"  {'全天计划购电量':<14s} {g_plan.sum():12.4f}")
-        lines.append(f"  {'全天计划购电费':<14s} {float(price_avg_day @ g_plan):12.2f}")
+        lines.append(f"  {'全天计划购电费':<14s} {float(price_actual_avg @ g_plan):12.2f}")
         lines.append("")
         lines.append("表1b  调整购电量（最终执行，指定时间段，kWh）")
         for name, t in dac.TBL1:
             lines.append(f"  {name:<14s} {g_final[t]:12.4f}")
         lines.append(f"  {'全天调整购电量':<14s} {g_final.sum():12.4f}")
-        lines.append(f"  {'全天调整购电费':<14s} {float(price_avg_day @ g_final):12.2f}")
+        lines.append(f"  {'全天调整购电费':<14s} {float(price_actual_avg @ g_final):12.2f}")
         lines.append(f"  {'当日调整相关费用':<14s} {r['adjustment_cost']:12.2f}")
         lines.append("")
         lines.append("表2  储能设备在指定时间段的充放电量 (kWh，最终执行)")
@@ -382,7 +419,9 @@ def main():
             r = results[idx]
             gv, cv, dv, socv = r["gv"], r["cv"], r["dv"], r["socv"]
             fig, ax = plt.subplots(3, 1, figsize=(11, 9), sharex=True)
-            ax[0].plot(h, r["price_raw"], color="tab:red")
+            ax[0].plot(h, r["price_raw"], label="真实电价", color="tab:red")
+            ax[0].plot(h, r["f_price_kw"], label="预测电价", color="tab:red", ls="--", alpha=0.6)
+            ax[0].legend(fontsize=7)
             ax[0].set_ylabel("电价 (元/kWh)")
             ax[0].set_title(f"问题4(问题3,波动电价,{args.epochs}点调整)：{rd}")
             ax[1].plot(h, r["actual_load_kw"], label="实际负荷", color="k")
