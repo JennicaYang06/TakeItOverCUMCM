@@ -6,7 +6,7 @@
 `envs\robowriter` 这个环境装了 numpy/pandas/openpyxl/cvxpy/matplotlib，可以直接用：
 
 ```powershell
-& "$env:USERPROFILE\anaconda3\envs\robowriter\python.exe" code\problem2.py
+& "$env:USERPROFILE\anaconda3\envs\robowriter\python.exe" code\problem2_lightgbm.py
 ```
 
 也可以新建一个专用环境：
@@ -16,7 +16,7 @@
    python -m pip install -r code/requirements.txt
    ```
 
-注意：这些环境都没装问题1用的 `GLPK_MI` 求解器，`problem2.py` 改用了 cvxpy 自带的
+注意：这些环境都没装问题1用的 `GLPK_MI` 求解器，问题2/3/4都改用了 cvxpy 自带的
 `HIGHS`（开源、速度更快）。如果要让 `problem1.py` 也能跑，把 `solver='GLPK_MI'`
 改成 `solver='HIGHS'` 即可。
 
@@ -55,11 +55,11 @@ result2.xlsx 导出、汇总报告逻辑——**两版除"怎么预测负荷/光
 
 求解器用 `HIGHS`（本机没装问题1用的 `GLPK_MI`），性能上365次MILP全部求解约15-20秒。
 
-### 版本A：`problem2.py`（Holt-Winters + 晴空包络）
+### 版本A：`problem2_holtwinter.py`（Holt-Winters + 晴空包络）
 
 ```powershell
-python code/problem2.py          # 全年 365 天完整仿真
-python code/problem2.py 45       # 调试：只跑前 45 天，快速验证
+python code/problem2_holtwinter.py          # 全年 365 天完整仿真
+python code/problem2_holtwinter.py 45       # 调试：只跑前 45 天，快速验证
 ```
 
 - **负荷预测**：144个时刻分别做加性 Holt-Winters（周期=7天，捕捉工作日/周末模式）。
@@ -67,12 +67,12 @@ python code/problem2.py 45       # 调试：只跑前 45 天，快速验证
   天气持续性）。
 - 输出到 `results/problem2/holtwinters/`。
 
-### 版本B：`forecast_lightgbm_最终版.py`（LightGBM 逐日滚动重训）
+### 版本B：`problem2_lightgbm.py`（LightGBM 逐日滚动重训，问题3、问题4也用这套）
 
 ```powershell
-python "code/forecast_lightgbm_最终版.py"                    # 全年
-python "code/forecast_lightgbm_最终版.py" --debug-days 40    # 调试
-python "code/forecast_lightgbm_最终版.py" --no-safety-margin # 关掉安全边际看基线
+python code/problem2_lightgbm.py                    # 全年
+python code/problem2_lightgbm.py --debug-days 40    # 调试
+python code/problem2_lightgbm.py --no-safety-margin # 关掉安全边际看基线
 ```
 
 - **负荷/光伏预测**：每天用"当天之前的全部历史"重新训练一个 LightGBM（load、pv 各一个），
@@ -98,80 +98,65 @@ python "code/forecast_lightgbm_最终版.py" --no-safety-margin # 关掉安全�
 
 ## 运行问题 3
 
+问题3只用 LightGBM 做负荷预测（不再维护 Holt-Winters 版本）。原来"0点12点"和
+"0点6点12点18点"两个日内调整方案是分开两个文件写的，后来合并成一个脚本，用 `--epochs`
+切换：
+
 ```powershell
-python code/problem3.py                    # 全年，开启日内调整（默认）
-python code/problem3.py --no-adjustment    # 全年，关闭调整，只执行0点计划（对比用基线）
-python code/problem3.py --debug-days 40    # 调试
-python code/problem3.py --no-safety-margin # 关掉报童安全边际
+python code/problem3_lightgbm.py                    # 全年，--epochs 4（默认，6/12/18点各调整一次）
+python code/problem3_lightgbm.py --epochs 2          # 全年，只在12点调整一次
+python code/problem3_lightgbm.py --epochs 0          # 全年，不调整，只执行0点计划（对比用基线）
+python code/problem3_lightgbm.py --debug-days 40     # 调试
+python code/problem3_lightgbm.py --no-safety-margin  # 关掉报童安全边际
 ```
 
 题目变化：光伏不用自己预测了——附件3直接给出每天0:00/6:00/12:00/18:00发布的"未来24小时
-整点"光伏预报，问题3只需把整点值线性插值到10分钟粒度（`interp_hourly_to_10min`）。负荷
-仍然没有官方预报，沿用问题2的 `LoadForecaster`，0点做一次预测、全天不再修正。
+整点"光伏预报，只需把整点值线性插值到10分钟粒度（`interp_hourly_to_10min`）。负荷仍然
+没有官方预报，用 `problem2_lightgbm.py` 同款的逐日滚动重训LightGBM（只训练"load"，
+比问题2的LightGBM版快一倍），0点做一次预测、全天不再修正。电价是附件1那条全年重复的
+固定曲线（不像问题4是波动电价），所以 `DayAheadMILP` 全年只构建一次、复用编译结果。
 
 流程：
 1. 0点，用负荷预测+附件3的0点光伏预报解全天144格的日前MILP，得到"计划购电量" `g_plan`
    （对外报告用，也是后续调整费用的基准）。
-2. 6:00/12:00/18:00各自用当时发布的新预报，对"剩余一整天"重新求解，但只把接下来6小时
-   （36格）锁定为最终结果，其余格子只是这次求解的预览、下次调整会覆盖。**踩过的坑**：
-   一开始按"只优化接下来6小时"实现，储能会被过度放空——调整量比计划少的部分能按0.5倍价格
-   抵扣，模型只要供需平衡不等式仍满足，就有动机不计后果地多放电、少买电去薅这个折扣，
-   看不到后面几段还要不要用这些电。把优化范围扩到当天24:00为止后，储能递推约束贯穿整个
-   剩余时段，这个问题才消失。
+2. `--epochs 4`：6:00/12:00/18:00各自用当时发布的新预报，对"剩余一整天"重新求解，但
+   只把接下来6小时（36格）锁定为最终结果，其余格子只是这次求解的预览、下次调整会覆盖。
+   `--epochs 2`：只在12:00调整一次，对剩余12小时（72格）联合重优化、全部锁定。
+   `--epochs 0`：不调整，`g_final` 全天等于 `g_plan`。
+   **踩过的坑**：一开始按"只优化接下来6小时的局部窗口"实现，储能会被过度放空——调整量
+   比计划少的部分能按0.5倍价格抵扣，模型只要供需平衡不等式仍满足，就有动机不计后果地
+   多放电、少买电去薅这个折扣，看不到后面几段还要不要用这些电。把优化范围扩到当天24:00
+   为止后，储能递推约束贯穿整个剩余时段，这个问题才消失（`--epochs 2` 因为一次性锁定
+   到底，从一开始就不会有这个问题）。
 3. 调整量比计划量多的部分按1.5倍价格多付，少的部分按0.5倍价格计入违约金（`SegmentMILP`，
    两个辅助变量 up/down 的目标系数一正一负、净系数为正，最优解会自动收敛到正确的
    `max(Δ,0)`/`max(-Δ,0)`分解，不能直接写成 `cp.pos()`相减，那样不满足DCP）。
 4. 一天结束后用附件2真实值回代最终执行的g/c/d，供给仍不够的部分按5倍价紧急购电（同问题2）。
-5. 报童安全边际：0点全天计划、以及每次调整锁定的36格，分别维护**各自独立**的滚动80分位数
+5. 报童安全边际：0点全天计划、以及每次调整锁定的时段，分别维护**各自独立**的滚动80分位数
    误差跟踪器（`NetErrorTracker`）——不能共用0点那条(24小时视距、误差偏大)，会把过大的
    边际错误地叠加到已经用更短视距/更准预报修正过的调整阶段上。
 
-### 是否需要引入其他时刻的预报调整？（全年 2025.2.1-12.31，334天）
+输出到 `results/problem3_lightgbm/{no_adjustment,2epoch_adjustment,4epoch_adjustment}/`。
 
-| | 只执行0点计划 | 6/12/18点调整 |
-| --- | --- | --- |
-| 计划购电费 | 1321.0万 | 1321.0万 |
-| 调整相关费用 | 0 | 2.6万 |
-| 紧急购电费 | 104.6万 | 69.5万 |
-| **总费用** | **1425.6万** | **1393.1万（↓2.3%）** |
+### 是否需要引入更多次预报调整？（全年 2025.2.1-12.31，334天，均已启用安全边际）
 
-需要——用1.5倍/0.5倍的温和调整价格去替换本该发生的5倍紧急购电价格，紧急购电费降了约1/3，
-换来的调整净支出很小（只有2.6万），全年总费用降了约2.3%。
+| | 只执行0点计划 | 2点调整(0+12点) | 4点调整(0+6+12+18点) |
+| --- | --- | --- | --- |
+| 计划购电费 | 1306.7万 | 1306.7万 | 1306.7万 |
+| 调整相关费用 | 0 | -4.8万 | -0.1万 |
+| 紧急购电费 | 109.8万 | 87.4万 | 73.2万 |
+| **总费用** | **1416.5万** | **1389.3万** | **1379.8万（↓2.6%）** |
 
-### 版本B：`problem3_lightgbm.py`（负荷预测换成 LightGBM）
-
-```powershell
-python code/problem3_lightgbm.py                    # 全年，开启日内调整
-python code/problem3_lightgbm.py --no-adjustment     # 全年，关闭调整
-python code/problem3_lightgbm.py --debug-days 40     # 调试
-```
-
-光伏依然直接用附件3官方预报（题目给定，两版没有分歧），唯一的区别是负荷预测方法：
-`problem3.py` 用 Holt-Winters，这一版换成 `forecast_lightgbm_最终版.py` 同款的逐日滚动
-重训LightGBM（只训练"load"一个目标，比问题2的LightGBM版快一倍）。0点计划MILP、
-6/12/18点联合剩余日重优化、报童安全边际、紧急购电结算、result3.xlsx导出完全复用
-`problem3.py` 里的常量和 `day_ahead_common.py`，没有改动共用模块。输出到
-`results/problem3_lightgbm/{with_adjustment,no_adjustment}/`。
-
-### 四种组合的全年对比（2025.2.1-12.31，334天，均已启用安全边际）
-
-| | Holt-Winters, 只计划 | Holt-Winters, 有调整 | LightGBM, 只计划 | LightGBM, 有调整 |
-| --- | --- | --- | --- | --- |
-| 负荷 MAPE | 3.23% | 3.23% | 3.06% | 3.06% |
-| 计划购电费 | 1321.0万 | 1321.0万 | 1306.7万 | 1306.7万 |
-| 调整相关费用 | 0 | 2.6万 | 0 | -0.1万 |
-| 紧急购电费 | 104.6万 | 69.5万 | 109.8万 | 73.2万 |
-| **总费用** | **1425.6万** | **1393.1万** | **1416.5万** | **1379.8万** |
-
-两个维度的收益基本正交：LightGBM负荷预测比Holt-Winters略准（3.06%对3.23%），带来约
-0.6%-1%的总费用下降；加日内调整再省2.3%-2.6%；两者叠加起来最省（LightGBM+有调整
-全年1379.8万，是四种组合里最低的，比最基础的"Holt-Winters只计划"低约3.2%）。
+需要——用1.5倍/0.5倍的温和调整价格去替换本该发生的5倍紧急购电价格，紧急购电费从
+109.8万一路降到73.2万，换来的调整净支出很小，且边际收益递减（0→2点省27.2万，
+2→4点再省9.5万）。全年总费用比只执行0点计划低约2.6%。
 
 ## `day_ahead_common.py`：各版共用的基础设施
 
 - `DayAheadMILP`：单日 MILP（cvxpy Parameter 化，编译一次、365天复用求解）。
 - `SegmentMILP`：问题3的日内调整MILP，任意段长可复用（问题3按108/72/36三种剩余长度各建一个）。
-- `LoadForecaster`：负荷预测（Holt-Winters），问题2、问题3共用。
+- `LoadForecaster`：负荷预测（Holt-Winters），现在只有 `problem2_holtwinter.py` 用；
+  问题3、问题4的负荷/电价预测都改用LightGBM（`problem2_lightgbm.py` 里的训练函数）。
 - `NetErrorTracker`：报童安全边际用的滚动分位数状态。
 - `interp_hourly_to_10min` / `adjacent_average_with_prev`：整点预报插值、非整天分段的
   首尾相接平均（问题3专用，`adjacent_average` 原版假设144点整天循环，不能直接套在分段上）。
