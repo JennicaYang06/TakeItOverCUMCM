@@ -180,6 +180,58 @@ python code/problem3_lightgbm.py --debug-days 40     # 调试
 - `export_result2_template` / `export_result3_template` / `plot_representative_days`：
   写官方模板、画四个代表日的曲线图。
 
+## 运行问题 4（波动电价下重算问题2、问题3）
+
+问题4要求电价换成附件4——365天每天一条不同的144点电价曲线（不再是附件1那条全年重复的
+固定曲线）。这个改动看似小，但 `day_ahead_common.py` 里 `export_result2_template` /
+`export_result3_template` / `build_summary_report` 这几个函数的"全天购电费"都是拿调用方
+传入的*单一* `price_avg` 向量重新算的，没法直接套用到"每天电价都不同"的场景。问过之后
+决定不改 `day_ahead_common.py`（怕影响问题2、问题3已经跑出来的结果），`problem4_2.py` /
+`problem4_3.py` 里各自写了一套"按天电价"版本的导出/汇总/画图逻辑；充放电表、紧急购电表
+本来就和电价无关，仍直接复用 `day_ahead_common._fill_charge_sheet` /
+`_fill_emergency_sheet`。日前MILP的结构完全不变，只是 `DayAheadMILP` 现在**每天**用当天
+电价重新构建一次（cvxpy构建本身很便宜，365次构建+求解实测约20秒，不影响可用性），
+不再是只构建一次、靠Parameter复用编译结果——因为价格天天不同，Parameter复用的意义
+（"只更新数值不用重新编译"）本来就用不上。
+
+```powershell
+python code/problem4_2.py                       # 对应问题2：LightGBM+安全边际，全年
+python code/problem4_3.py --epochs 4             # 对应问题3：4个预报点(0/6/12/18点)调整
+python code/problem4_3.py --epochs 2             # 对应问题3：2个预报点(0/12点)调整
+python code/problem4_3.py --no-adjustment        # 对应问题3：只执行0点计划，不调整
+```
+
+- `problem4_2.py`：直接复用 `problem2_lightgbm.py` 的特征工程和逐日滚动重训LightGBM
+  （load、pv各一个），只是把电价源换成附件4。输出到 `results/problem4/problem2_volatile/`。
+- `problem4_3.py`：负荷预测复用 `problem2_lightgbm.py`（只训练load），光伏直接用附件3
+  官方预报，调整逻辑和之前问题3验证过的一致——每次调整对"剩余一整天"联合重优化、只锁定
+  接下来的时段为最终结果（`--epochs 4` 每次锁6小时，`--epochs 2` 只在12点调整一次、
+  锁剩下的12小时）。输出到 `results/problem4/problem3_volatile/{4epoch_adjustment,
+  2epoch_adjustment,no_adjustment}/`。
+
+### 波动电价下的全年结果（2025.2.1-12.31，334天，均已启用安全边际）
+
+问题2部分：
+
+| | 固定电价(问题2, LightGBM) | 波动电价(问题4_2) |
+| --- | --- | --- |
+| 总费用 | 1393.4万 | 1458.6万 |
+
+问题3部分——同样复现"预报点数量"的对比：
+
+| | 只执行0点计划 | 2点调整(0+12点) | 4点调整(0+6+12+18点) |
+| --- | --- | --- | --- |
+| 计划购电费 | 1366.7万 | 1366.7万 | 1366.7万 |
+| 调整相关费用 | 0 | -5.0万 | -1.5万 |
+| 紧急购电费 | 114.4万 | 91.7万 | 77.6万 |
+| **总费用** | **1481.1万** | **1453.4万** | **1442.8万** |
+
+结论和固定电价下（问题3）一致，波动电价没有改变定性结论：调整越勤（预报点越多），
+总费用越低，且边际收益递减（0→2点省27.7万，2→4点再省10.6万）。波动电价本身让全年
+总费用比固定电价高出不少（问题4_2比问题2高约4.7%），这是因为附件4的电价均值/波动性
+和附件1那条示例曲线本来就不是同一回事，不代表"波动"这件事本身推高了成本——两者不是
+同一价格序列的两种用法，没有严格可比性，这里只做同一模型下"调整策略是否有效"的对比。
+
 ## 模型（问题 1）
 
 单日线性规划，决策为每 10 分钟的计划购电量 `g[t]`、储能充电量 `c[t]`、放电量 `d[t]`、
